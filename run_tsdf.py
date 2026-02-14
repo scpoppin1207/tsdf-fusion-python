@@ -23,7 +23,8 @@ def parse_args():
   parser.add_argument("--extrinsics_npy", required=True, help="Path to extrinsics numpy file of shape (N, 4, 4).")
   parser.add_argument("--output_dir", default=".", help="Directory to save mesh.ply and renders (default: current directory).")
   parser.add_argument("--voxel_size", type=float, default=0.02, help="TSDF voxel size in meters (default: 0.02).")
-  parser.add_argument("--sdf_trunc", type=float, default=None, help="TSDF truncation distance in meters (default: 10 * voxel_size).")
+  parser.add_argument("--sdf_trunc", type=float, default=None, help="TSDF truncation distance in meters (optional override).")
+  parser.add_argument("--sdf_trunc_multiplier", type=float, default=10.0, help="Final sdf_trunc = sdf_trunc_multiplier * voxel_size (default: 10.0).")
   parser.add_argument("--depth_max", type=float, default=50.0, help="Max depth used by TSDF integration in meters (default: 50.0).")
   parser.add_argument("--block_count", type=int, default=400000, help="VoxelBlockGrid block capacity (default: 400000).")
   parser.add_argument("--block_resolution", type=int, default=16, help="Voxels per block side (default: 16).")
@@ -88,12 +89,26 @@ def _color_image_iter(image_paths):
     yield cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB)
 
 
+def _get_active_block_count(volume):
+  try:
+    hm = volume.hashmap()
+    # Open3D HashMap API differs slightly across versions/builds.
+    if hasattr(hm, "size"):
+      return int(hm.size())
+    if hasattr(hm, "active_size"):
+      return int(hm.active_size())
+  except Exception:
+    return None
+  return None
+
+
 def integrate_tsdf(
   depth_iter,
   intrinsics,
   extrinsics,
   voxel_size,
   sdf_trunc,
+  sdf_trunc_multiplier=10.0,
   obs_weight=1.0,
   depth_scale=1.0,
   depth_max=50.0,
@@ -102,11 +117,16 @@ def integrate_tsdf(
   block_resolution=16,
 ):
   device = _get_device()
+  safety_depth_cap = 500.0
 
-  if sdf_trunc is None:
-    sdf_trunc = 10.0 * float(voxel_size)
   if depth_max is None:
     depth_max = 50.0
+  if float(depth_max) > safety_depth_cap:
+    print(
+      "[WARN] depth_max={} is too large for stable VBG integration. "
+      "Clamping to safety cap {}m.".format(depth_max, safety_depth_cap)
+    )
+  depth_max = min(float(depth_max), safety_depth_cap)
 
   # Open3D 0.18 tensor TSDF API uses VoxelBlockGrid (GPU-capable).
   volume = o3d.t.geometry.VoxelBlockGrid(
@@ -118,15 +138,20 @@ def integrate_tsdf(
     block_count=int(block_count),
     device=device,
   )
+  if sdf_trunc is None:
+    sdf_trunc = float(sdf_trunc_multiplier) * float(voxel_size)
   trunc_voxel_multiplier = float(max(1.0, sdf_trunc / voxel_size))
 
   t0_elapse = time.time()
   n_imgs = 0
+  prev_active_blocks = 0
 
   color_iter = iter(color_iter) if color_iter is not None else None
   for i, depth in enumerate(depth_iter):
     depth_im = depth.astype(np.float32)
     depth_im[np.logical_or(np.isnan(depth_im), np.isinf(depth_im))] = 0
+    # Keep integration numerically stable for outdoor long-range depth tails.
+    depth_im[np.logical_or(depth_im <= 0, depth_im > depth_max)] = 0
 
     h, w = depth_im.shape
     depth_t = o3d.t.geometry.Image(
@@ -173,6 +198,20 @@ def integrate_tsdf(
       float(depth_max),
       trunc_voxel_multiplier,
     )
+    # Force CUDA sync so kernel errors surface at the correct frame.
+    if device.get_type() == o3d.core.Device.DeviceType.CUDA:
+      o3d.core.cuda.synchronize()
+    active_blocks = _get_active_block_count(volume)
+    if active_blocks is not None:
+      growth = active_blocks - prev_active_blocks
+      print(
+        "[TSDF] frame {}/{} active_blocks={} growth={:+d} capacity={}".format(
+          i + 1, intrinsics.shape[0], active_blocks, growth, int(block_count)
+        )
+      )
+      if active_blocks >= int(block_count):
+        print("[WARN] VoxelBlockGrid reached block_count capacity; new regions may be dropped.")
+      prev_active_blocks = active_blocks
     n_imgs += 1
 
   fps = n_imgs / max(1e-6, (time.time() - t0_elapse))
@@ -180,7 +219,17 @@ def integrate_tsdf(
 
 
 def extract_mesh(volume):
-  mesh = volume.extract_triangle_mesh(weight_threshold=1.0)
+  try:
+    mesh = volume.extract_triangle_mesh(weight_threshold=1.0)
+  except RuntimeError as err:
+    err_msg = str(err).lower()
+    if "illegal memory access" not in err_msg:
+      raise
+    print("[WARN] CUDA mesh extraction failed with illegal memory access. Retrying on CPU copy.")
+    if hasattr(volume, "cpu"):
+      mesh = volume.cpu().extract_triangle_mesh(weight_threshold=1.0)
+    else:
+      raise
   mesh_legacy = mesh.to_legacy()
   mesh_legacy.compute_vertex_normals()
   return mesh_legacy
@@ -292,6 +341,7 @@ def run_fusion(args):
     extrinsics,
     voxel_size=args.voxel_size,
     sdf_trunc=args.sdf_trunc,
+    sdf_trunc_multiplier=args.sdf_trunc_multiplier,
     obs_weight=args.obs_weight,
     depth_scale=1.0,
     depth_max=args.depth_max,

@@ -13,9 +13,10 @@ DEPTH_NPY="${ROOT_DIR}/depth/depth.npy"
 INTRINSICS_NPY="${ROOT_DIR}/cameras/pred_intrinsics.npy"
 EXTRINSICS_NPY="${ROOT_DIR}/cameras/pred_extrinsics.npy"
 OUTPUT_DIR="${ROOT_DIR}/tsdf_fusion"
-VOXEL_SIZE=0.005
-SDF_TRUNC=($VOXEL_SIZE * 10)
-BLOCK_COUNT=800000
+VOXEL_SIZE=0.002
+BLOCK_COUNT=400000
+SDF_TRUNC_MULTIPLIER=15
+DEPTH_MAX=500.0
 
 
 
@@ -29,6 +30,7 @@ python run_tsdf.py \
   --extrinsics_npy "$EXTRINSICS_NPY" \
   --output_dir "$OUTPUT_DIR" \
   --voxel_size "$VOXEL_SIZE" \
-  --sdf_trunc "$SDF_TRUNC" \
   --block_count "$BLOCK_COUNT" \
+  --sdf_trunc_multiplier "$SDF_TRUNC_MULTIPLIER" \
+  --depth_max "$DEPTH_MAX" \
   --render_write
